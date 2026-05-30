@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import copy
 import datetime as dt
 import email.utils
 import html
+import http.client
 import json
 import os
 import re
@@ -21,6 +23,7 @@ from typing import Any
 
 
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
+DBLP_API_URL = os.getenv("DBLP_API_URL", "http://dblp.org/search/publ/api")
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
 CROSSREF_WORKS_URL = "https://api.crossref.org/works"
 SEMANTIC_SCHOLAR_SEARCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
@@ -33,6 +36,7 @@ DEFAULT_MAX_STORED_PAPERS = 800
 DEFAULT_MAX_DATA_BYTES = 8 * 1024 * 1024
 DEFAULT_RECENT_HISTORY_DAYS = 45
 TRANSIENT_HTTP_CODES = {429, 500, 502, 503, 504}
+DBLP_TRANSIENT_HTTP_CODES = {429, 502, 503, 504}
 DEFAULT_SOURCE_TYPES = ["arxiv", "openalex", "crossref", "semantic_scholar"]
 FEED_NAMESPACES = {"atom": "http://www.w3.org/2005/Atom"}
 
@@ -54,6 +58,16 @@ class SourceConfig:
     enabled: bool = True
     headers_env: str = ""
     bearer_token_env: str = ""
+
+
+@dataclass(frozen=True)
+class ConferenceSource:
+    id: str
+    name: str
+    group: str
+    dblp_toc_patterns: list[str]
+    years: list[int]
+    enabled: bool = True
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -135,6 +149,101 @@ def parse_sources(config: dict[str, Any]) -> list[SourceConfig]:
     return sources
 
 
+def merge_venues(default_venues: list[dict[str, Any]], override_venues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for venue in [*default_venues, *override_venues]:
+        if not isinstance(venue, dict):
+            continue
+        venue_id = str(venue.get("id") or slugify(str(venue.get("name", "venue"))))
+        if venue_id not in by_id:
+            order.append(venue_id)
+            by_id[venue_id] = {"id": venue_id}
+        by_id[venue_id].update(venue)
+        by_id[venue_id]["id"] = venue_id
+    return [by_id[venue_id] for venue_id in order]
+
+
+def merge_config(default_config: dict[str, Any], override_config: dict[str, Any] | None) -> dict[str, Any]:
+    if not override_config:
+        return default_config
+
+    merged = copy.deepcopy(default_config)
+    for key, value in override_config.items():
+        if key == "conference_sources" and isinstance(value, dict):
+            default_sources = merged.get("conference_sources", {})
+            if not isinstance(default_sources, dict):
+                default_sources = {}
+            merged_sources = copy.deepcopy(default_sources)
+            include_defaults = bool(value.get("include_default_venues", True))
+            default_venues = default_sources.get("venues", []) if include_defaults else []
+            override_venues = value.get("venues", [])
+            additional_venues = value.get("additional_venues", [])
+            for source_key, source_value in value.items():
+                if source_key not in {"venues", "additional_venues", "include_default_venues"}:
+                    merged_sources[source_key] = source_value
+            if "venues" in value or "additional_venues" in value or not include_defaults:
+                merged_sources["venues"] = merge_venues(
+                    default_venues if isinstance(default_venues, list) else [],
+                    [
+                        *(override_venues if isinstance(override_venues, list) else []),
+                        *(additional_venues if isinstance(additional_venues, list) else []),
+                    ],
+                )
+            merged["conference_sources"] = merged_sources
+        else:
+            merged[key] = value
+    return merged
+
+
+def parse_years(value: Any) -> list[int]:
+    years = []
+    if not isinstance(value, list):
+        return years
+    for item in value:
+        try:
+            years.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(years), reverse=True)
+
+
+def default_conference_years(config: dict[str, Any], now: dt.datetime) -> list[int]:
+    configured = parse_years(config.get("years"))
+    if configured:
+        return configured
+    current_year = int(config.get("current_year") or now.year)
+    lookback_years = max(1, int(config.get("lookback_years", 2) or 2))
+    return [current_year - offset for offset in range(lookback_years)]
+
+
+def parse_conference_sources(config: dict[str, Any], now: dt.datetime) -> list[ConferenceSource]:
+    source_config = config.get("conference_sources", {})
+    if not isinstance(source_config, dict) or not source_config.get("enabled", False):
+        return []
+
+    default_years = default_conference_years(source_config, now)
+    sources = []
+    for item in source_config.get("venues", []):
+        if not isinstance(item, dict):
+            continue
+        patterns = item.get("dblp_toc_patterns") or item.get("dblp_toc_pattern") or []
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        years = parse_years(item.get("years")) or default_years
+        source = ConferenceSource(
+            id=str(item.get("id") or slugify(str(item.get("name", "venue")))),
+            name=str(item.get("name") or item.get("id") or "Venue"),
+            group=str(item.get("group") or "conference"),
+            dblp_toc_patterns=[str(pattern) for pattern in patterns if str(pattern).strip()],
+            years=years,
+            enabled=bool(item.get("enabled", True)),
+        )
+        if source.enabled and source.dblp_toc_patterns:
+            sources.append(source)
+    return sources
+
+
 def github_request(url: str, token: str) -> Any:
     req = urllib.request.Request(
         url,
@@ -185,7 +294,7 @@ def load_issue_config(default_config: dict[str, Any]) -> dict[str, Any]:
                 print(f"Warning: config issue JSON is invalid, using config file: {exc}", file=sys.stderr)
                 return default_config
             if issue_config and issue_config.get("topics"):
-                return issue_config
+                return merge_config(default_config, issue_config)
     return default_config
 
 
@@ -363,6 +472,261 @@ def fetch_arxiv(topic: Topic, max_results: int) -> list[dict[str, Any]]:
             }
         )
     return papers
+
+
+def dblp_retry_wait_seconds(exc: Exception, attempt: int) -> float:
+    min_wait = float(os.getenv("DBLP_RETRY_MIN_SECONDS", "5"))
+    if isinstance(exc, urllib.error.HTTPError):
+        retry_after = exc.headers.get("Retry-After")
+        if retry_after and retry_after.isdigit():
+            return max(min_wait, float(retry_after))
+    base = float(os.getenv("DBLP_RETRY_BASE_SECONDS", "5"))
+    cap = float(os.getenv("DBLP_RETRY_MAX_SECONDS", "60"))
+    return max(min_wait, min(cap, base * (2**attempt)))
+
+
+def is_retryable_dblp_error(exc: Exception) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in DBLP_TRANSIENT_HTTP_CODES
+    return isinstance(exc, (TimeoutError, urllib.error.URLError, OSError, http.client.RemoteDisconnected))
+
+
+def fetch_json_url(url: str, user_agent: str, timeout_seconds: float) -> dict[str, Any]:
+    req = urllib.request.Request(url, headers={"User-Agent": user_agent})
+    with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def fetch_dblp_json(query: str, max_results: int) -> dict[str, Any]:
+    params = {
+        "format": "json",
+        "h": str(max_results),
+        "q": query,
+    }
+    url = f"{DBLP_API_URL}?{urllib.parse.urlencode(params)}"
+    retry_count = max(1, int(os.getenv("DBLP_RETRIES", "3")))
+    timeout_seconds = float(os.getenv("DBLP_TIMEOUT_SECONDS", "45"))
+    last_error: Exception | None = None
+    for attempt in range(retry_count):
+        try:
+            return fetch_json_url(url, "paper-daily-collector/1.0 (+https://github.com/Futuresxy/paper-daily)", timeout_seconds)
+        except Exception as exc:
+            last_error = exc
+            if not is_retryable_dblp_error(exc) or attempt == retry_count - 1:
+                raise
+            wait_seconds = dblp_retry_wait_seconds(exc, attempt)
+            print(f"DBLP temporary error for query {query}: {exc}; retrying in {wait_seconds:.0f}s", flush=True)
+            time.sleep(wait_seconds)
+    raise RuntimeError(f"DBLP request failed: {last_error}")
+
+
+def ensure_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def parse_dblp_authors(info: dict[str, Any]) -> list[str]:
+    authors = info.get("authors", {}).get("author", []) if isinstance(info.get("authors"), dict) else []
+    names = []
+    for author in ensure_list(authors):
+        if isinstance(author, dict):
+            name = author.get("text", "")
+        else:
+            name = str(author)
+        name = normalize_space(str(name))
+        if name:
+            names.append(name)
+    return names
+
+
+def parse_dblp_hits(data: dict[str, Any], source: ConferenceSource, year: int, toc_key: str) -> list[dict[str, Any]]:
+    hits_data = data.get("result", {}).get("hits", {}).get("hit", [])
+    papers = []
+    for hit in ensure_list(hits_data):
+        if not isinstance(hit, dict):
+            continue
+        info = hit.get("info", {})
+        if not isinstance(info, dict):
+            continue
+        key = str(info.get("key") or "")
+        title = normalize_space(str(info.get("title") or ""))
+        if not key or not title or key.endswith(f"/{year}"):
+            continue
+        venue = str(info.get("venue") or source.name)
+        pages = str(info.get("pages") or "").strip()
+        doi = str(info.get("doi") or "").strip()
+        ee = str(info.get("ee") or "").strip()
+        url = str(info.get("url") or "").strip()
+        paper_url = url or f"https://dblp.org/rec/{key}"
+        summary_parts = [f"DBLP 题录：{source.name} {year} 会议论文。"]
+        if pages:
+            summary_parts.append(f"页码：{pages}。")
+        if doi:
+            summary_parts.append(f"DOI：{doi}。")
+        papers.append(
+            {
+                "id": f"dblp:{key}",
+                "source": f"DBLP · {source.name}",
+                "source_type": "conference",
+                "title": html.unescape(title).rstrip("."),
+                "authors": parse_dblp_authors(info),
+                "summary": " ".join(summary_parts),
+                "published": f"{year}-01-01T00:00:00+00:00",
+                "updated": f"{year}-01-01T00:00:00+00:00",
+                "paper_url": paper_url,
+                "pdf_url": ee or paper_url,
+                "categories": [source.name, source.group, str(year)],
+                "venue": venue,
+                "conference": {
+                    "id": source.id,
+                    "name": source.name,
+                    "group": source.group,
+                    "year": year,
+                    "dblp_key": key,
+                    "dblp_toc": toc_key,
+                    "doi": doi,
+                    "ee": ee,
+                    "pages": pages,
+                },
+            }
+        )
+    return papers
+
+
+def strip_html_tags(value: str) -> str:
+    return normalize_space(re.sub(r"<[^>]+>", "", html.unescape(value)))
+
+
+def dblp_html_url_for_toc(toc_key: str) -> str:
+    path = toc_key
+    if path.endswith(".bht"):
+        path = path[:-4] + ".html"
+    elif not path.endswith(".html"):
+        path += ".html"
+    return "http://dblp.org/" + path.lstrip("/")
+
+
+def conference_paper_from_dblp_html_chunk(
+    key: str,
+    chunk: str,
+    source: ConferenceSource,
+    year: int,
+    toc_key: str,
+) -> dict[str, Any] | None:
+    title_match = re.search(r'<span class="title"[^>]*>(.*?)</span>', chunk, flags=re.S)
+    if not title_match:
+        return None
+    title = strip_html_tags(title_match.group(1)).rstrip(".")
+    if not title or title.lower().startswith("proceedings of"):
+        return None
+
+    authors = [
+        strip_html_tags(author)
+        for author in re.findall(r'<span itemprop="name" title="([^"]+)">', chunk)
+    ]
+    pages_match = re.search(r'<span itemprop="pagination">(.*?)</span>', chunk, flags=re.S)
+    pages = strip_html_tags(pages_match.group(1)) if pages_match else ""
+    ee_match = re.search(r'<li class="ee">\s*<a href="([^"]+)"', chunk, flags=re.S)
+    ee = html.unescape(ee_match.group(1)) if ee_match else ""
+    paper_url = f"https://dblp.org/rec/{key}"
+    summary_parts = [f"DBLP 题录：{source.name} {year} 会议论文。"]
+    if pages:
+        summary_parts.append(f"页码：{pages}。")
+    return {
+        "id": f"dblp:{key}",
+        "source": f"DBLP · {source.name}",
+        "source_type": "conference",
+        "title": title,
+        "authors": authors,
+        "summary": " ".join(summary_parts),
+        "published": f"{year}-01-01T00:00:00+00:00",
+        "updated": f"{year}-01-01T00:00:00+00:00",
+        "paper_url": paper_url,
+        "pdf_url": ee or paper_url,
+        "categories": [source.name, source.group, str(year)],
+        "venue": source.name,
+        "conference": {
+            "id": source.id,
+            "name": source.name,
+            "group": source.group,
+            "year": year,
+            "dblp_key": key,
+            "dblp_toc": toc_key,
+            "doi": "",
+            "ee": ee,
+            "pages": pages,
+        },
+    }
+
+
+def parse_dblp_html_toc(html_text: str, source: ConferenceSource, year: int, toc_key: str) -> list[dict[str, Any]]:
+    starts = list(re.finditer(r'<li class="entry inproceedings" id="([^"]+)"', html_text))
+    papers = []
+    for index, match in enumerate(starts):
+        key = html.unescape(match.group(1))
+        if key.endswith(f"/{year}"):
+            continue
+        end = starts[index + 1].start() if index + 1 < len(starts) else len(html_text)
+        paper = conference_paper_from_dblp_html_chunk(key, html_text[match.start():end], source, year, toc_key)
+        if paper:
+            papers.append(paper)
+    return papers
+
+
+def fetch_dblp_html_toc(toc_key: str, source: ConferenceSource, year: int) -> list[dict[str, Any]]:
+    url = dblp_html_url_for_toc(toc_key)
+    timeout_seconds = float(os.getenv("DBLP_TIMEOUT_SECONDS", "45"))
+    retry_count = max(1, int(os.getenv("DBLP_RETRIES", "3")))
+    last_error: Exception | None = None
+    for attempt in range(retry_count):
+        req = urllib.request.Request(url, headers={"User-Agent": "paper-daily-collector/1.0 (+https://github.com/Futuresxy/paper-daily)"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                html_text = resp.read().decode("utf-8", "replace")
+            return parse_dblp_html_toc(html_text, source, year, toc_key)
+        except Exception as exc:
+            last_error = exc
+            if not is_retryable_dblp_error(exc) or attempt == retry_count - 1:
+                raise
+            wait_seconds = dblp_retry_wait_seconds(exc, attempt)
+            print(f"DBLP temporary HTML error for {source.name} {year}: {exc}; retrying in {wait_seconds:.0f}s", flush=True)
+            time.sleep(wait_seconds)
+    raise RuntimeError(f"DBLP HTML request failed: {last_error}")
+
+
+def fetch_dblp_conference(source: ConferenceSource, max_results: int) -> list[dict[str, Any]]:
+    papers = []
+    errors = []
+    request_count = 0
+    pattern_delay_seconds = float(os.getenv("DBLP_PATTERN_DELAY_SECONDS", "3"))
+    for year in source.years:
+        for pattern_index, pattern in enumerate(source.dblp_toc_patterns):
+            if request_count:
+                time.sleep(pattern_delay_seconds)
+            toc_key = pattern.format(year=year)
+            query = f"toc:{toc_key}:"
+            request_count += 1
+            try:
+                data = fetch_dblp_json(query, max_results)
+            except Exception as exc:
+                try:
+                    fallback_papers = fetch_dblp_html_toc(toc_key, source, year)
+                except Exception as fallback_exc:
+                    errors.append(fallback_exc)
+                    print(
+                        f"Warning: DBLP TOC request failed for {source.name} {year} pattern {pattern_index + 1}: {exc}; HTML fallback failed: {fallback_exc}",
+                        file=sys.stderr,
+                    )
+                    continue
+                papers.extend(fallback_papers[:max_results])
+                continue
+            papers.extend(parse_dblp_hits(data, source, year, toc_key))
+    if not papers and errors:
+        raise errors[-1]
+    return dedupe_papers(papers)
 
 
 def openalex_abstract_text(work: dict[str, Any]) -> str:
@@ -770,6 +1134,15 @@ def score_paper(topic: Topic, paper: dict[str, Any]) -> dict[str, Any]:
 def fallback_summary(paper: dict[str, Any], best_match: dict[str, Any]) -> dict[str, str]:
     abstract = paper.get("summary", "")
     first_sentence = re.split(r"(?<=[.!?])\s+", abstract)[0] if abstract else ""
+    if paper.get("source_type") == "conference":
+        return {
+            "problem": "会议源当前只提供题录信息，未抓取论文摘要。",
+            "method": first_sentence[:300] if first_sentence else "请打开论文链接查看方法细节。",
+            "innovation": "需要接入模型 API 或阅读全文后提取更精确的创新点。",
+            "evidence": "题录信息来自会议索引，技术细节需要在原文中核验。",
+            "limitations": "DBLP 通常不提供摘要；部分 DOI 或出版社页面可能有访问限制。",
+            "why_relevant": best_match.get("reason", "与配置方向存在文本匹配。"),
+        }
     return {
         "problem": "未配置模型 API，当前仅基于标题、摘要和关键词生成基础摘要。",
         "method": first_sentence[:300] if first_sentence else "请打开论文链接查看方法细节。",
@@ -824,6 +1197,7 @@ def call_openai_compatible(prompt: str) -> dict[str, Any]:
 
 
 def build_llm_prompt(topic: Topic, paper: dict[str, Any], base_match: dict[str, Any]) -> str:
+    abstract_label = "摘要/题录信息" if paper.get("source_type") == "conference" else "摘要"
     return f"""
 请根据论文标题、摘要、分类和我的研究方向，输出精确中文分析。不要夸大摘要中没有的信息；如果证据不足，请明确说明。
 
@@ -836,7 +1210,7 @@ def build_llm_prompt(topic: Topic, paper: dict[str, Any], base_match: dict[str, 
 标题：{paper.get("title", "")}
 作者：{", ".join(paper.get("authors", [])[:8])}
 arXiv 分类：{", ".join(paper.get("categories", []))}
-摘要：{paper.get("summary", "")}
+{abstract_label}：{paper.get("summary", "")}
 
 基础匹配信息：
 分数：{base_match.get("score")}
@@ -915,6 +1289,56 @@ def best_match_level(paper: dict[str, Any]) -> str:
     return str((paper.get("best_match") or {}).get("level") or "low").lower()
 
 
+def conference_identity(paper: dict[str, Any]) -> tuple[str, int] | None:
+    conference = paper.get("conference")
+    if not isinstance(conference, dict):
+        return None
+    conference_id = str(conference.get("id") or "")
+    try:
+        year = int(conference.get("year"))
+    except (TypeError, ValueError):
+        return None
+    if not conference_id or year <= 0:
+        return None
+    return conference_id, year
+
+
+def cached_conference_years(existing_payload: dict[str, Any]) -> dict[str, set[int]]:
+    cached: dict[str, set[int]] = {}
+    papers = existing_payload.get("papers", []) if isinstance(existing_payload, dict) else []
+    for paper in papers:
+        if not isinstance(paper, dict) or paper.get("source_type") != "conference":
+            continue
+        identity = conference_identity(paper)
+        if not identity:
+            continue
+        conference_id, year = identity
+        cached.setdefault(conference_id, set()).add(year)
+    return cached
+
+
+def active_conference_years(sources: list[ConferenceSource]) -> dict[str, set[int]]:
+    return {source.id: set(source.years) for source in sources}
+
+
+def uncached_conference_years(source: ConferenceSource, cached_years_by_source: dict[str, set[int]]) -> list[int]:
+    cached_years = cached_years_by_source.get(source.id, set())
+    return [year for year in source.years if year not in cached_years]
+
+
+def should_retain_conference_paper(
+    paper: dict[str, Any],
+    active_years_by_source: dict[str, set[int]] | None,
+) -> bool:
+    if paper.get("source_type") != "conference" or active_years_by_source is None:
+        return False
+    identity = conference_identity(paper)
+    if not identity:
+        return False
+    conference_id, year = identity
+    return year in active_years_by_source.get(conference_id, set())
+
+
 def load_existing_payload(output_path: Path) -> dict[str, Any]:
     if not output_path.exists():
         return {}
@@ -930,6 +1354,7 @@ def merge_with_retained_papers(
     existing_payload: dict[str, Any],
     now: dt.datetime,
     recent_history_days: int,
+    active_conference_years_by_source: dict[str, set[int]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     existing_papers = existing_payload.get("papers", []) if isinstance(existing_payload, dict) else []
     existing_generated_at = str(existing_payload.get("generated_at_iso") or existing_payload.get("generated_at") or now.isoformat())
@@ -948,7 +1373,11 @@ def merge_with_retained_papers(
             and seen_at
             and (now.date() - seen_at.date()).days <= recent_history_days
         )
-        if best_match_level(paper) in RETAINED_MATCH_LEVELS or is_recent:
+        is_active_conference = should_retain_conference_paper(paper, active_conference_years_by_source)
+        if paper.get("source_type") == "conference" and active_conference_years_by_source is not None and not is_active_conference:
+            dropped_low += 1
+            continue
+        if best_match_level(paper) in RETAINED_MATCH_LEVELS or is_recent or is_active_conference:
             retained_by_key[key] = paper
             if is_recent and best_match_level(paper) not in RETAINED_MATCH_LEVELS:
                 retained_recent += 1
@@ -991,7 +1420,10 @@ def merge_with_retained_papers(
 
 def deletion_sort_key(paper: dict[str, Any]) -> tuple[int, dt.datetime]:
     level = best_match_level(paper)
-    relevance_priority = 0 if level == "low" else 1
+    if paper.get("source_type") == "conference":
+        relevance_priority = 1
+    else:
+        relevance_priority = 0 if level == "low" else 2
     return relevance_priority, paper_datetime(paper)
 
 
@@ -1044,11 +1476,17 @@ def collect(
     topics = parse_topics(config)
     sources = parse_sources(config)
     now = dt.datetime.now(dt.timezone.utc)
+    conference_sources = parse_conference_sources(config, now)
+    active_conference_years_by_source = active_conference_years(conference_sources)
     existing_payload = load_existing_payload(output_path)
+    cached_conference_years_by_source = cached_conference_years(existing_payload)
     cutoff, collection_mode = collection_cutoff(existing_payload, now, days, incremental_since_last_run)
     all_candidates = []
     successful_fetches = 0
     failed_fetches = 0
+    successful_conference_fetches = 0
+    failed_conference_fetches = 0
+    skipped_cached_conference_years = 0
     source_stats: dict[str, dict[str, Any]] = {}
     source_delay_seconds = float(os.getenv("SOURCE_DELAY_SECONDS", "3"))
     for source in sources:
@@ -1098,12 +1536,50 @@ def collect(
                         )
                     break
 
+    max_per_conference = int(os.getenv("MAX_PER_CONFERENCE", "1000"))
+    conference_delay_seconds = float(os.getenv("DBLP_DELAY_SECONDS", "5"))
+    for index, source in enumerate(conference_sources):
+        years_to_fetch = uncached_conference_years(source, cached_conference_years_by_source)
+        skipped_cached_conference_years += len(source.years) - len(years_to_fetch)
+        source_stats[source.name] = {
+            "type": "conference",
+            "successful_fetches": 0,
+            "failed_fetches": 0,
+            "skipped_cached_years": len(source.years) - len(years_to_fetch),
+        }
+        if not years_to_fetch:
+            print(f"Skipping DBLP conference source from cache: {source.name} {', '.join(str(year) for year in source.years)}", flush=True)
+            continue
+        if index:
+            time.sleep(conference_delay_seconds)
+        source_to_fetch = ConferenceSource(
+            id=source.id,
+            name=source.name,
+            group=source.group,
+            dblp_toc_patterns=source.dblp_toc_patterns,
+            years=years_to_fetch,
+            enabled=source.enabled,
+        )
+        print(f"Fetching DBLP conference papers for source: {source.name} {', '.join(str(year) for year in years_to_fetch)}", flush=True)
+        try:
+            source_papers = fetch_dblp_conference(source_to_fetch, max_per_conference)
+            all_candidates.extend(source_papers)
+            successful_fetches += 1
+            successful_conference_fetches += 1
+            source_stats[source.name]["successful_fetches"] += 1
+        except Exception as exc:
+            failed_fetches += 1
+            failed_conference_fetches += 1
+            source_stats[source.name]["failed_fetches"] += 1
+            source_stats[source.name]["last_error"] = str(exc)
+            print(f"Warning: DBLP request failed for {source.name}: {exc}", file=sys.stderr)
+
     if successful_fetches == 0 and failed_fetches > 0 and existing_payload:
         existing = existing_payload
         if existing.get("papers"):
             print("All configured sources failed; preserving existing paper data.", file=sys.stderr)
             retained_papers, retention_stats = merge_with_retained_papers(
-                [], existing_payload, now, recent_history_days
+                [], existing_payload, now, recent_history_days, active_conference_years_by_source
             )
             retained_papers.sort(key=lambda p: (p["best_match"]["score"], p.get("published", "")), reverse=True)
             existing["papers"] = retained_papers
@@ -1116,6 +1592,10 @@ def collect(
                     "successful_fetches": successful_fetches,
                     "failed_fetches": failed_fetches,
                     "source_stats": source_stats,
+                    "successful_conference_fetches": successful_conference_fetches,
+                    "failed_conference_fetches": failed_conference_fetches,
+                    "skipped_cached_conference_years": skipped_cached_conference_years,
+                    "conference_source_count": len(conference_sources),
                     **retention_stats,
                 }
             )
@@ -1130,11 +1610,10 @@ def collect(
 
     recent_papers = []
     for paper in dedupe_papers(all_candidates):
+        is_conference_paper = paper.get("source_type") == "conference"
         published = paper.get("published") or paper.get("updated")
-        if not published:
-            continue
-        published_at = parse_datetime(str(published))
-        if published_at and published_at >= cutoff:
+        published_at = parse_datetime(str(published)) if published else None
+        if is_conference_paper or (published_at and published_at >= cutoff):
             matches = [score_paper(topic, paper) for topic in topics]
             matches.sort(key=lambda item: item["score"], reverse=True)
             best_match = matches[0]
@@ -1176,7 +1655,7 @@ def collect(
             paper["chinese_summary"] = fallback_summary(paper, paper["best_match"])
 
     merged_papers, retention_stats = merge_with_retained_papers(
-        recent_papers, existing_payload, now, recent_history_days
+        recent_papers, existing_payload, now, recent_history_days, active_conference_years_by_source
     )
     merged_papers.sort(key=lambda p: (p["best_match"]["score"], p.get("published", "")), reverse=True)
 
@@ -1194,12 +1673,17 @@ def collect(
             "collection_cutoff_iso": cutoff.isoformat(),
             "max_per_topic": max_per_topic,
             "sources": [source.__dict__ for source in sources],
+            "conference_sources": [source.__dict__ for source in conference_sources],
             "source_stats": source_stats,
             "llm_enabled": llm_enabled(),
             "llm_concurrency": int(os.getenv("LLM_CONCURRENCY", "2")),
             "recent_history_days": recent_history_days,
             "successful_fetches": successful_fetches,
             "failed_fetches": failed_fetches,
+            "successful_conference_fetches": successful_conference_fetches,
+            "failed_conference_fetches": failed_conference_fetches,
+            "skipped_cached_conference_years": skipped_cached_conference_years,
+            "conference_source_count": len(conference_sources),
             **retention_stats,
         },
     }

@@ -58,6 +58,10 @@ jobs:
           CROSSREF_EMAIL: ${{ vars.CROSSREF_EMAIL || '' }}
           OPENALEX_EMAIL: ${{ vars.OPENALEX_EMAIL || '' }}
           SOURCE_DELAY_SECONDS: ${{ vars.SOURCE_DELAY_SECONDS || '3' }}
+          DBLP_DELAY_SECONDS: ${{ vars.DBLP_DELAY_SECONDS || '5' }}
+          DBLP_PATTERN_DELAY_SECONDS: ${{ vars.DBLP_PATTERN_DELAY_SECONDS || '3' }}
+          DBLP_RETRIES: ${{ vars.DBLP_RETRIES || '3' }}
+          MAX_PER_CONFERENCE: ${{ vars.MAX_PER_CONFERENCE || '1000' }}
           SEMANTIC_SCHOLAR_API_KEY: ${{ secrets.SEMANTIC_SCHOLAR_API_KEY }}
           SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
           CUSTOM_FEED_HEADERS: ${{ secrets.CUSTOM_FEED_HEADERS }}

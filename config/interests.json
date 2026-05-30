@@ -5,6 +5,90 @@
     { "type": "crossref", "name": "Crossref" },
     { "type": "semantic_scholar", "name": "Semantic Scholar" }
   ],
+  "conference_sources": {
+    "enabled": true,
+    "current_year": 2026,
+    "lookback_years": 2,
+    "venues": [
+      {
+        "id": "isca",
+        "name": "ISCA",
+        "group": "computer architecture",
+        "dblp_toc_patterns": ["db/conf/isca/isca{year}.bht"]
+      },
+      {
+        "id": "micro",
+        "name": "MICRO",
+        "group": "computer architecture",
+        "dblp_toc_patterns": ["db/conf/micro/micro{year}.bht"]
+      },
+      {
+        "id": "hpca",
+        "name": "HPCA",
+        "group": "computer architecture",
+        "dblp_toc_patterns": ["db/conf/hpca/hpca{year}.bht"]
+      },
+      {
+        "id": "asplos",
+        "name": "ASPLOS",
+        "group": "computer architecture",
+        "dblp_toc_patterns": [
+          "db/conf/asplos/asplos{year}-1.bht",
+          "db/conf/asplos/asplos{year}-2.bht",
+          "db/conf/asplos/asplos{year}-3.bht",
+          "db/conf/asplos/asplos{year}-4.bht"
+        ]
+      },
+      {
+        "id": "mlsys",
+        "name": "MLSys",
+        "group": "systems for machine learning",
+        "dblp_toc_patterns": ["db/conf/mlsys/mlsys{year}.bht"]
+      },
+      {
+        "id": "eurosys",
+        "name": "EuroSys",
+        "group": "systems",
+        "dblp_toc_patterns": ["db/conf/eurosys/eurosys{year}.bht"]
+      },
+      {
+        "id": "sosp",
+        "name": "SOSP",
+        "group": "systems",
+        "dblp_toc_patterns": ["db/conf/sosp/sosp{year}.bht"]
+      },
+      {
+        "id": "osdi",
+        "name": "OSDI",
+        "group": "systems",
+        "dblp_toc_patterns": ["db/conf/osdi/osdi{year}.bht"]
+      },
+      {
+        "id": "nsdi",
+        "name": "NSDI",
+        "group": "systems",
+        "dblp_toc_patterns": ["db/conf/nsdi/nsdi{year}.bht"]
+      },
+      {
+        "id": "sigcomm",
+        "name": "SIGCOMM",
+        "group": "systems",
+        "dblp_toc_patterns": ["db/conf/sigcomm/sigcomm{year}.bht"]
+      },
+      {
+        "id": "usenix_atc",
+        "name": "USENIX ATC",
+        "group": "systems",
+        "dblp_toc_patterns": ["db/conf/usenix/usenix{year}.bht"]
+      },
+      {
+        "id": "fast",
+        "name": "FAST",
+        "group": "systems",
+        "dblp_toc_patterns": ["db/conf/fast/fast{year}.bht"]
+      }
+    ]
+  },
   "topics": [
     {
       "id": "llm_low_precision_quantization",

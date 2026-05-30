@@ -5,18 +5,27 @@ import unittest
 from unittest import mock
 
 from scripts.collect_papers import (
+    ConferenceSource,
     arxiv_retry_wait_seconds,
+    cached_conference_years,
     collection_cutoff,
+    default_conference_years,
     fetch_arxiv,
+    is_retryable_dblp_error,
     is_retryable_arxiv_error,
     merge_with_retained_papers,
+    merge_config,
     openalex_abstract_text,
+    parse_conference_sources,
+    parse_dblp_html_toc,
+    parse_dblp_hits,
     parse_sources,
     should_retry_arxiv_error,
     source_request_headers,
     SourceConfig,
     Topic,
     trim_papers_for_storage,
+    uncached_conference_years,
 )
 
 
@@ -85,6 +94,13 @@ class RetentionTest(unittest.TestCase):
         self.assertTrue(is_retryable_arxiv_error(rate_limited))
         self.assertTrue(is_retryable_arxiv_error(TimeoutError("timed out")))
         self.assertFalse(is_retryable_arxiv_error(not_found))
+
+    def test_dblp_does_not_retry_missing_toc_500(self) -> None:
+        missing_toc = urllib.error.HTTPError("url", 500, "Internal Server Error", {}, None)
+        rate_limited = urllib.error.HTTPError("url", 429, "Too Many Requests", {}, None)
+
+        self.assertFalse(is_retryable_dblp_error(missing_toc))
+        self.assertTrue(is_retryable_dblp_error(rate_limited))
 
     def test_arxiv_retry_policy_fast_fails_throttling_by_default(self) -> None:
         rate_limited = urllib.error.HTTPError("url", 429, "Too Many Requests", {}, None)
@@ -198,6 +214,31 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual(stats["dropped_low_relevance_count"], 1)
         self.assertTrue(next(item for item in merged if item["id"] == "old-high")["retained_from_previous_run"])
 
+    def test_merge_retains_only_active_conference_years(self) -> None:
+        now = dt.datetime(2026, 5, 28, tzinfo=dt.timezone.utc)
+        active = paper("isca-2025", "low", "2025-01-01T00:00:00+00:00")
+        active["source_type"] = "conference"
+        active["conference"] = {"id": "isca", "year": 2025}
+        stale = paper("isca-2024", "low", "2024-01-01T00:00:00+00:00")
+        stale["source_type"] = "conference"
+        stale["conference"] = {"id": "isca", "year": 2024}
+        existing = {
+            "generated_at_iso": "2026-05-27T00:00:00+00:00",
+            "papers": [active, stale],
+        }
+
+        merged, stats = merge_with_retained_papers(
+            [],
+            existing,
+            now,
+            recent_history_days=45,
+            active_conference_years_by_source={"isca": {2026, 2025}},
+        )
+
+        self.assertEqual([item["id"] for item in merged], ["isca-2025"])
+        self.assertEqual(stats["retained_paper_count"], 1)
+        self.assertEqual(stats["dropped_low_relevance_count"], 1)
+
     def test_collection_cutoff_uses_previous_run_for_incremental_mode(self) -> None:
         now = dt.datetime(2026, 5, 28, 22, tzinfo=dt.timezone.utc)
         cutoff, mode = collection_cutoff(
@@ -236,6 +277,167 @@ class RetentionTest(unittest.TestCase):
         trimmed, stats = trim_papers_for_storage(payload, max_stored_papers=1, max_data_bytes=0)
         self.assertEqual([item["id"] for item in trimmed], ["newer-high"])
         self.assertEqual(stats["storage_trimmed_by_level"]["high"], 1)
+
+    def test_conference_years_default_to_recent_window(self) -> None:
+        now = dt.datetime(2026, 5, 28, tzinfo=dt.timezone.utc)
+
+        self.assertEqual(default_conference_years({}, now), [2026, 2025])
+        self.assertEqual(default_conference_years({"lookback_years": 3}, now), [2026, 2025, 2024])
+        self.assertEqual(default_conference_years({"years": [2024, "2026", "bad"]}, now), [2026, 2024])
+
+    def test_cached_conference_years_reads_existing_payload(self) -> None:
+        payload = {
+            "papers": [
+                {"source_type": "conference", "conference": {"id": "isca", "year": 2025}},
+                {"source_type": "conference", "conference": {"id": "isca", "year": "2026"}},
+                {"source_type": "arxiv", "conference": {"id": "isca", "year": 2024}},
+            ]
+        }
+
+        self.assertEqual(cached_conference_years(payload), {"isca": {2026, 2025}})
+
+    def test_uncached_conference_years_skips_cache_hits(self) -> None:
+        source = ConferenceSource(
+            id="isca",
+            name="ISCA",
+            group="computer architecture",
+            dblp_toc_patterns=["db/conf/isca/isca{year}.bht"],
+            years=[2026, 2025],
+        )
+
+        self.assertEqual(uncached_conference_years(source, {"isca": {2025}}), [2026])
+        self.assertEqual(uncached_conference_years(source, {"isca": {2026, 2025}}), [])
+
+    def test_issue_config_keeps_default_conferences_and_adds_custom_venue(self) -> None:
+        default = {
+            "conference_sources": {
+                "enabled": True,
+                "current_year": 2026,
+                "venues": [
+                    {
+                        "id": "isca",
+                        "name": "ISCA",
+                        "group": "computer architecture",
+                        "dblp_toc_patterns": ["db/conf/isca/isca{year}.bht"],
+                    }
+                ],
+            },
+            "topics": [{"name": "Default", "keywords": []}],
+        }
+        override = {
+            "conference_sources": {
+                "additional_venues": [
+                    {
+                        "id": "pldi",
+                        "name": "PLDI",
+                        "group": "programming languages",
+                        "dblp_toc_patterns": ["db/conf/pldi/pldi{year}.bht"],
+                    }
+                ]
+            },
+            "topics": [{"name": "Custom", "keywords": ["compiler"]}],
+        }
+
+        merged = merge_config(default, override)
+        venue_ids = [venue["id"] for venue in merged["conference_sources"]["venues"]]
+
+        self.assertEqual(venue_ids, ["isca", "pldi"])
+        self.assertEqual(merged["topics"][0]["name"], "Custom")
+
+    def test_parse_conference_sources_can_disable_defaults(self) -> None:
+        now = dt.datetime(2026, 5, 28, tzinfo=dt.timezone.utc)
+        config = {
+            "conference_sources": {
+                "enabled": True,
+                "years": [2025],
+                "venues": [
+                    {
+                        "id": "isca",
+                        "name": "ISCA",
+                        "enabled": False,
+                        "dblp_toc_patterns": ["db/conf/isca/isca{year}.bht"],
+                    },
+                    {
+                        "id": "mlsys",
+                        "name": "MLSys",
+                        "dblp_toc_patterns": "db/conf/mlsys/mlsys{year}.bht",
+                    },
+                ],
+            }
+        }
+
+        sources = parse_conference_sources(config, now)
+
+        self.assertEqual([source.id for source in sources], ["mlsys"])
+        self.assertEqual(sources[0].years, [2025])
+
+    def test_parse_dblp_hits_builds_conference_papers(self) -> None:
+        source = ConferenceSource(
+            id="isca",
+            name="ISCA",
+            group="computer architecture",
+            dblp_toc_patterns=["db/conf/isca/isca{year}.bht"],
+            years=[2024],
+        )
+        data = {
+            "result": {
+                "hits": {
+                    "hit": [
+                        {
+                            "info": {
+                                "key": "conf/isca/Example24",
+                                "title": "An Efficient Tensor Accelerator.",
+                                "authors": {"author": [{"text": "Ada Example"}, {"text": "Lin System"}]},
+                                "venue": "ISCA",
+                                "pages": "1-14",
+                                "doi": "10.1145/example",
+                                "ee": "https://doi.org/10.1145/example",
+                                "url": "https://dblp.org/rec/conf/isca/Example24",
+                            }
+                        },
+                        {"info": {"key": "conf/isca/2024", "title": "Proceedings"}},
+                    ]
+                }
+            }
+        }
+
+        papers = parse_dblp_hits(data, source, 2024, "db/conf/isca/isca2024.bht")
+
+        self.assertEqual(len(papers), 1)
+        self.assertEqual(papers[0]["id"], "dblp:conf/isca/Example24")
+        self.assertEqual(papers[0]["source_type"], "conference")
+        self.assertEqual(papers[0]["title"], "An Efficient Tensor Accelerator")
+        self.assertEqual(papers[0]["authors"], ["Ada Example", "Lin System"])
+        self.assertEqual(papers[0]["conference"]["year"], 2024)
+
+    def test_parse_dblp_html_toc_builds_conference_papers(self) -> None:
+        source = ConferenceSource(
+            id="usenix_atc",
+            name="USENIX ATC",
+            group="systems",
+            dblp_toc_patterns=["db/conf/usenix/usenix{year}.bht"],
+            years=[2025],
+        )
+        html = """
+        <li class="entry inproceedings" id="conf/usenix/2025">
+          <span class="title" itemprop="name">Proceedings of the 2025 USENIX Annual Technical Conference.</span>
+        </li>
+        <li class="entry inproceedings" id="conf/usenix/GuptaIYBPKK25">
+          <li class="ee"><a href="https://www.usenix.org/conference/atc25/presentation/gupta">electronic edition</a></li>
+          <span itemprop="author"><span itemprop="name" title="Sushant Kumar Gupta">Sushant Kumar Gupta</span></span>,
+          <span itemprop="author"><span itemprop="name" title="Anil Raghunath Iyer">Anil Raghunath Iyer</span></span>:<br>
+          <span class="title" itemprop="name">Fast ACS: Low-Latency File-Based Ordered Message Delivery at Scale.</span>
+          <span itemprop="pagination">1-17</span>
+        </li>
+        """
+
+        papers = parse_dblp_html_toc(html, source, 2025, "db/conf/usenix/usenix2025.bht")
+
+        self.assertEqual(len(papers), 1)
+        self.assertEqual(papers[0]["id"], "dblp:conf/usenix/GuptaIYBPKK25")
+        self.assertEqual(papers[0]["title"], "Fast ACS: Low-Latency File-Based Ordered Message Delivery at Scale")
+        self.assertEqual(papers[0]["authors"], ["Sushant Kumar Gupta", "Anil Raghunath Iyer"])
+        self.assertEqual(papers[0]["pdf_url"], "https://www.usenix.org/conference/atc25/presentation/gupta")
 
 
 if __name__ == "__main__":
