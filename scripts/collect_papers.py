@@ -1450,6 +1450,44 @@ def score_paper(topic: Topic, paper: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def keyword_hit_bonus(paper: dict[str, Any]) -> float:
+    hits = (paper.get("best_match") or {}).get("keyword_hits") or []
+    return min(1.0, len(hits) / 6)
+
+
+def freshness_score(paper: dict[str, Any], now: dt.datetime) -> float:
+    published = parse_datetime(str(paper.get("published") or ""))
+    if not published:
+        published = paper_activity_datetime(paper)
+    age_days = max(0.0, (now - published).total_seconds() / 86400)
+    return max(0.0, 1.0 - age_days / 30)
+
+
+def has_pdf_link(paper: dict[str, Any]) -> bool:
+    pdf_url = str(paper.get("pdf_url") or "").strip().lower()
+    return bool(pdf_url and pdf_url != "#" and (pdf_url.endswith(".pdf") or "/pdf/" in pdf_url))
+
+
+def final_score(paper: dict[str, Any], now: dt.datetime) -> float:
+    relevance = float((paper.get("best_match") or {}).get("score") or 0.0)
+    # final_score is only used for ranking; best_match.score remains the original relevance score.
+    combined = (
+        0.70 * relevance
+        + 0.15 * keyword_hit_bonus(paper)
+        + 0.10 * freshness_score(paper, now)
+        + 0.05 * (1.0 if has_pdf_link(paper) else 0.0)
+    )
+    return round(max(0.0, min(1.0, combined)), 3)
+
+
+def update_final_score(paper: dict[str, Any], now: dt.datetime) -> None:
+    paper["final_score"] = final_score(paper, now)
+
+
+def final_score_sort_key(paper: dict[str, Any]) -> tuple[float, dt.datetime]:
+    return float(paper.get("final_score") or 0.0), paper_activity_datetime(paper)
+
+
 def env_float(name: str, default: float) -> float:
     value = os.getenv(name)
     if value is None or not value.strip():
@@ -1702,15 +1740,134 @@ def summarize_one(args: tuple[Topic, dict[str, Any]]) -> tuple[str, dict[str, st
     return paper_id, summary, adjusted_match
 
 
-def dedupe_papers(papers: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    seen = set()
-    unique = []
+def extract_arxiv_id(paper: dict[str, Any]) -> str:
+    candidates = [
+        paper.get("arxiv_id"),
+        paper.get("id"),
+        paper.get("paper_url"),
+        paper.get("pdf_url"),
+        paper.get("arxiv_url"),
+        paper.get("abstract_source_url"),
+    ]
+    for value in candidates:
+        match = re.search(r"(?<!\d)(\d{4}\.\d{4,5})(?:v\d+)?(?!\d)", str(value or ""), flags=re.I)
+        if match:
+            return match.group(1).lower()
+    return ""
+
+
+def extract_doi(paper: dict[str, Any]) -> str:
+    conference = paper.get("conference") if isinstance(paper.get("conference"), dict) else {}
+    candidates = [
+        paper.get("doi"),
+        conference.get("doi") if isinstance(conference, dict) else "",
+        paper.get("id"),
+        paper.get("paper_url"),
+        paper.get("pdf_url"),
+        paper.get("summary"),
+    ]
+    for value in candidates:
+        match = re.search(r"\b10\.\d{4,9}/[-._;()/:a-zA-Z0-9]+\b", str(value or ""), flags=re.I)
+        if match:
+            return match.group(0).rstrip(".,;:)").lower()
+    return ""
+
+
+def normalized_paper_title(paper: dict[str, Any]) -> str:
+    return title_match_key(str(paper.get("title") or ""))
+
+
+def dedupe_key(paper: dict[str, Any], separate_collections: bool = True) -> str:
+    collection = "conference" if paper.get("source_type") == "conference" else "daily"
+    prefix = f"{collection}:" if separate_collections else ""
+    arxiv_id = extract_arxiv_id(paper)
+    if arxiv_id:
+        return f"{prefix}arxiv:{arxiv_id}"
+    doi = extract_doi(paper)
+    if doi:
+        return f"{prefix}doi:{doi}"
+    title = normalized_paper_title(paper)
+    if title:
+        return f"{prefix}title:{title}"
+    return f"{prefix}fallback:{paper.get('id') or paper.get('paper_url') or id(paper)}"
+
+
+def has_chinese_summary(paper: dict[str, Any]) -> bool:
+    summary = paper.get("chinese_summary")
+    return isinstance(summary, dict) and any(str(value).strip() for value in summary.values())
+
+
+def paper_completeness_score(paper: dict[str, Any]) -> tuple[int, float, dt.datetime]:
+    score = 0
+    if has_pdf_link(paper):
+        score += 30
+    if has_meaningful_summary(paper):
+        score += 30
+    if has_chinese_summary(paper):
+        score += 40
+    if paper.get("paper_url"):
+        score += 5
+    score += min(10, len(paper.get("authors", []) or []))
+    score += min(5, len(paper.get("categories", []) or []))
+    score += 5 if paper.get("abstract_source") else 0
+    relevance = float((paper.get("best_match") or {}).get("score") or 0.0)
+    return score, relevance, paper_activity_datetime(paper)
+
+
+def merge_duplicate_records(primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str, Any]:
+    merged = copy.deepcopy(primary)
+    # Keep the more complete record as the base, but fill obvious missing metadata from the duplicate.
+    for field in (
+        "paper_url",
+        "pdf_url",
+        "arxiv_id",
+        "arxiv_url",
+        "abstract_source",
+        "abstract_source_id",
+        "abstract_source_url",
+        "venue",
+        "source_type",
+    ):
+        if not merged.get(field) and secondary.get(field):
+            merged[field] = secondary[field]
+    if not has_meaningful_summary(merged) and has_meaningful_summary(secondary):
+        merged["summary"] = secondary.get("summary", "")
+    if not has_chinese_summary(merged) and has_chinese_summary(secondary):
+        merged["chinese_summary"] = secondary["chinese_summary"]
+    for field in ("authors", "categories"):
+        merged[field] = list(dict.fromkeys([*(merged.get(field) or []), *(secondary.get(field) or [])]))
+    for field in ("matches", "best_match", "conference", "final_score"):
+        if not merged.get(field) and secondary.get(field):
+            merged[field] = secondary[field]
+    return merged
+
+
+def better_duplicate_record(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    if paper_completeness_score(right) > paper_completeness_score(left):
+        return merge_duplicate_records(right, left)
+    return merge_duplicate_records(left, right)
+
+
+def dedupe_papers(
+    papers: list[dict[str, Any]],
+    log_label: str = "",
+    separate_collections: bool = True,
+) -> list[dict[str, Any]]:
+    by_key: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
     for paper in papers:
-        key = paper.get("id") or paper.get("paper_url")
-        if key in seen:
+        key = dedupe_key(paper, separate_collections=separate_collections)
+        if key not in by_key:
+            by_key[key] = paper
+            order.append(key)
             continue
-        seen.add(key)
-        unique.append(paper)
+        by_key[key] = better_duplicate_record(by_key[key], paper)
+
+    unique = [by_key[key] for key in order]
+    if log_label:
+        before = len(papers)
+        after = len(unique)
+        print(f"Deduplicated {log_label}: before={before}, after={after}, removed={before - after}", flush=True)
     return unique
 
 
@@ -2085,6 +2242,7 @@ def collect(
             continue
         paper["matches"] = matches
         paper["best_match"] = best_match
+        update_final_score(paper, now)
         if in_backfill_window:
             paper["backfilled_from_recent_arxiv"] = True
             daily_outside_cutoff_count += 1
@@ -2092,14 +2250,14 @@ def collect(
         else:
             recent_papers.append(paper)
 
-    recent_papers.sort(key=lambda p: (p["best_match"]["score"], paper_activity_datetime(p)), reverse=True)
+    recent_papers.sort(key=final_score_sort_key, reverse=True)
     daily_recent_papers = [paper for paper in recent_papers if paper.get("source_type") != "conference"]
     conference_recent_papers = [paper for paper in recent_papers if paper.get("source_type") == "conference"]
     daily_backfill_added_count = 0
     min_daily_papers = max(0, env_int("MIN_DAILY_PAPERS", 8))
     if len(daily_recent_papers) < min_daily_papers and daily_backfill_candidates:
         daily_backfill_candidates.sort(
-            key=lambda p: (p["best_match"]["score"], paper_activity_datetime(p)),
+            key=final_score_sort_key,
             reverse=True,
         )
         existing_daily_ids = {str(paper.get("id", "")) for paper in daily_recent_papers}
@@ -2126,10 +2284,11 @@ def collect(
             matches.sort(key=lambda item: item["score"], reverse=True)
             paper["matches"] = matches
             paper["best_match"] = matches[0]
+            update_final_score(paper, now)
         conference_recent_papers.sort(key=lambda p: (p["best_match"]["score"], p.get("published", "")), reverse=True)
     recent_papers = sorted(
         [*daily_recent_papers, *conference_recent_papers],
-        key=lambda p: (p["best_match"]["score"], paper_activity_datetime(p)),
+        key=final_score_sort_key,
         reverse=True,
     )
     summaries_by_id: dict[str, tuple[dict[str, str], dict[str, Any]]] = {}
@@ -2163,6 +2322,7 @@ def collect(
             paper["matches"] = [adjusted_match if m["topic_id"] == adjusted_match["topic_id"] else m for m in paper["matches"]]
         else:
             paper["chinese_summary"] = fallback_summary(paper, paper["best_match"])
+        update_final_score(paper, now)
 
     daily_recent_papers = [paper for paper in recent_papers if paper.get("source_type") != "conference"]
     conference_recent_papers = [paper for paper in recent_papers if paper.get("source_type") == "conference"]
@@ -2176,7 +2336,17 @@ def collect(
         recent_history_days,
         active_conference_years_by_source,
     )
-    daily_merged_papers.sort(key=lambda p: (p["best_match"]["score"], paper_activity_datetime(p)), reverse=True)
+    daily_before_final_dedupe = len(daily_merged_papers)
+    daily_merged_papers = dedupe_papers(daily_merged_papers, log_label="daily final papers")
+    conference_before_final_dedupe = len(conference_merged_papers)
+    conference_merged_papers = dedupe_papers(conference_merged_papers, log_label="conference final papers")
+    daily_final_dedupe_removed = daily_before_final_dedupe - len(daily_merged_papers)
+    conference_final_dedupe_removed = conference_before_final_dedupe - len(conference_merged_papers)
+    for paper in daily_merged_papers:
+        update_final_score(paper, now)
+    for paper in conference_merged_papers:
+        update_final_score(paper, now)
+    daily_merged_papers.sort(key=final_score_sort_key, reverse=True)
     conference_merged_papers.sort(key=lambda p: (p["best_match"]["score"], paper_activity_datetime(p)), reverse=True)
 
     base_stats = {
@@ -2224,11 +2394,14 @@ def collect(
             **base_stats,
             "paper_count": len(daily_merged_papers),
             "new_paper_count": len(daily_recent_papers),
+            "dedupe_before_count": daily_before_final_dedupe,
+            "dedupe_after_count": len(daily_merged_papers),
+            "dedupe_removed_count": daily_final_dedupe_removed,
             **daily_retention_stats,
         },
     }
     trimmed_papers, storage_stats = trim_papers_for_storage(payload, max_stored_papers, max_data_bytes)
-    trimmed_papers.sort(key=lambda p: (p["best_match"]["score"], p.get("published", "")), reverse=True)
+    trimmed_papers.sort(key=final_score_sort_key, reverse=True)
     payload["papers"] = trimmed_papers
     payload["stats"].update(storage_stats)
     payload["stats"]["paper_count"] = len(trimmed_papers)
@@ -2246,6 +2419,9 @@ def collect(
             **base_stats,
             "paper_count": len(conference_merged_papers),
             "new_paper_count": len(conference_recent_papers),
+            "dedupe_before_count": conference_before_final_dedupe,
+            "dedupe_after_count": len(conference_merged_papers),
+            "dedupe_removed_count": conference_final_dedupe_removed,
             **conference_retention_stats,
         },
     }

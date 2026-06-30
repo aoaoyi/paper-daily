@@ -16,8 +16,10 @@ from scripts.collect_papers import (
     collection_cutoff,
     conference_abstract_sources,
     default_conference_years,
+    dedupe_papers,
     enrich_conference_paper_from_arxiv,
     fetch_arxiv,
+    final_score,
     find_conference_abstract_by_title,
     is_relevant_enough,
     has_meaningful_summary,
@@ -463,6 +465,48 @@ class RetentionTest(unittest.TestCase):
         self.assertFalse(is_relevant_enough(weak_title, {"score": 0.03, "keyword_hits": []}))
         self.assertFalse(is_relevant_enough(weak_conference, {"score": 0.05, "keyword_hits": []}))
         self.assertTrue(is_relevant_enough(keyword_match, {"score": 0.04, "keyword_hits": ["KV cache compression"]}))
+
+    def test_final_score_combines_relevance_keywords_freshness_and_pdf(self) -> None:
+        now = dt.datetime(2026, 5, 30, tzinfo=dt.timezone.utc)
+        candidate = paper("personalized", "medium", now.isoformat())
+        candidate["pdf_url"] = "https://arxiv.org/pdf/2605.00001"
+        candidate["best_match"]["keyword_hits"] = ["LLM inference", "KV cache"]
+
+        self.assertEqual(candidate["best_match"]["score"], 0.5)
+        self.assertEqual(final_score(candidate, now), 0.55)
+
+    def test_dedupe_prefers_arxiv_id_and_keeps_more_complete_record(self) -> None:
+        sparse = {
+            "id": "2605.00001v1",
+            "title": "Fast Tensor Compute",
+            "summary": "",
+            "published": "2026-05-29T00:00:00+00:00",
+        }
+        complete = {
+            "id": "openalex:W1",
+            "arxiv_id": "2605.00001v2",
+            "title": "Fast Tensor Compute",
+            "summary": "This paper presents a detailed architecture for tensor compute in LLM serving systems. " * 2,
+            "published": "2026-05-29T00:00:00+00:00",
+            "pdf_url": "https://arxiv.org/pdf/2605.00001v2",
+            "chinese_summary": {"problem": "问题", "method": "方法"},
+        }
+
+        deduped = dedupe_papers([sparse, complete])
+
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0]["id"], "openalex:W1")
+        self.assertEqual(deduped[0]["pdf_url"], "https://arxiv.org/pdf/2605.00001v2")
+        self.assertIn("chinese_summary", deduped[0])
+
+    def test_dedupe_falls_back_to_doi_then_normalized_title(self) -> None:
+        doi_a = {"id": "crossref:10.1145/ABC", "title": "A", "paper_url": "https://doi.org/10.1145/ABC"}
+        doi_b = {"id": "dblp:abc", "title": "A", "conference": {"doi": "10.1145/abc"}}
+        title_a = {"id": "one", "title": "Fast Tensor Compute: An LLM Study!"}
+        title_b = {"id": "two", "title": " fast tensor compute an llm study "}
+
+        self.assertEqual(len(dedupe_papers([doi_a, doi_b])), 1)
+        self.assertEqual(len(dedupe_papers([title_a, title_b])), 1)
 
     def test_llm_summary_skips_conference_and_title_only_by_default(self) -> None:
         self.assertFalse(should_summarize_paper_with_llm({"source_type": "conference", "summary": "DBLP 题录。"}))

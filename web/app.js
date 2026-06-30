@@ -129,6 +129,10 @@ function scoreOf(paper) {
   return Number(paper.best_match?.score || 0);
 }
 
+function finalScoreOf(paper) {
+  return Number(paper.final_score ?? paper.best_match?.score ?? 0);
+}
+
 function levelOf(paper) {
   return String(paper.best_match?.level || "low").toLowerCase();
 }
@@ -172,9 +176,12 @@ function matchesView(paper) {
 }
 
 function filteredPapers() {
-  return (activeData().papers || [])
+  const data = activeData();
+  const rankScore = data.data_kind === "daily" ? finalScoreOf : scoreOf;
+  return (data.papers || [])
     .filter((paper) => matchesBaseFilters(paper) && matchesView(paper))
-    .sort((a, b) => scoreOf(b) - scoreOf(a) || String(b.published || "").localeCompare(String(a.published || "")));
+    // Daily papers are ranked by the personalized final_score while the displayed badge keeps the original score.
+    .sort((a, b) => rankScore(b) - rankScore(a) || String(b.published || "").localeCompare(String(a.published || "")));
 }
 
 function setText(parent, selector, text) {
