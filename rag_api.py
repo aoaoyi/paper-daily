@@ -8,6 +8,7 @@ Start with:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -16,9 +17,22 @@ from pydantic import BaseModel
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - keeps retrieval-only mode usable without optional deps.
+    load_dotenv = None
+
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - handled by fallback answer generation.
+    OpenAI = None
+
 
 CORPUS_PATH = Path("web/data/rag_corpus.json")
 TOP_K = 3
+
+if load_dotenv:
+    load_dotenv()
 
 app = FastAPI(title="Paper Daily Local RAG Demo", version="0.1.0")
 
@@ -142,6 +156,93 @@ def build_answer(question: str, papers: list[dict[str, Any]]) -> str:
     )
 
 
+def llm_config() -> dict[str, str]:
+    return {
+        "api_key": os.getenv("LLM_API_KEY", "").strip(),
+        "base_url": os.getenv("LLM_BASE_URL", "").strip(),
+        "model": os.getenv("LLM_MODEL", "").strip(),
+    }
+
+
+def llm_available() -> bool:
+    config = llm_config()
+    return bool(OpenAI is not None and config["api_key"] and config["model"])
+
+
+def retrieved_context(papers: list[dict[str, Any]]) -> str:
+    blocks = []
+    for index, paper in enumerate(papers, start=1):
+        blocks.append(
+            "\n".join(
+                [
+                    f"Paper {index}:",
+                    f"Title: {paper.get('title', '')}",
+                    f"Authors: {paper.get('authors', '')}",
+                    f"Summary: {paper.get('summary', '')}",
+                    f"Source URL: {paper.get('source_url', '')}",
+                    f"PDF URL: {paper.get('pdf_url', '')}",
+                    f"Similarity: {paper.get('similarity', 0.0)}",
+                    f"Final Score: {paper.get('final_score', 0.0)}",
+                ]
+            )
+        )
+    return "\n\n".join(blocks)
+
+
+def build_llm_prompt(question: str, papers: list[dict[str, Any]]) -> str:
+    return f"""
+你是一个论文检索问答助手。请只根据给定的 retrieved_papers 回答，不要编造论文中没有的信息。
+
+回答要求：
+1. 使用中文回答。
+2. 先指出最相关论文。
+3. 简要说明为什么相关。
+4. 如果相关性不强，要明确说明“根据当前语料，相关性有限”。
+5. 不要引用 retrieved_papers 中没有出现的论文、实验结果或结论。
+
+用户问题：
+{question}
+
+retrieved_papers:
+{retrieved_context(papers)}
+""".strip()
+
+
+def generate_llm_answer(question: str, papers: list[dict[str, Any]]) -> tuple[str, bool, str]:
+    config = llm_config()
+    model = config["model"]
+    if not config["api_key"]:
+        return build_answer(question, papers), False, model
+    if OpenAI is None:
+        return build_answer(question, papers), False, model
+    if not model:
+        return build_answer(question, papers), False, model
+
+    try:
+        client_kwargs: dict[str, str] = {"api_key": config["api_key"]}
+        if config["base_url"]:
+            client_kwargs["base_url"] = config["base_url"]
+        client = OpenAI(**client_kwargs)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你是一个严谨的论文 RAG 问答助手，只能根据检索结果回答。",
+                },
+                {"role": "user", "content": build_llm_prompt(question, papers)},
+            ],
+            temperature=0.2,
+        )
+        answer = response.choices[0].message.content or ""
+        if not answer.strip():
+            return build_answer(question, papers), False, model
+        return answer.strip(), True, model
+    except Exception:
+        # API errors should not break the local demo; keep the retrieval-based answer as a safe fallback.
+        return build_answer(question, papers), False, model
+
+
 rag_index = RagIndex(CORPUS_PATH)
 
 
@@ -152,6 +253,8 @@ def health() -> dict[str, Any]:
         "corpus_path": str(CORPUS_PATH),
         "paper_count": len(rag_index.records),
         "error": rag_index.error,
+        "llm_configured": llm_available(),
+        "model": llm_config()["model"],
     }
 
 
@@ -167,8 +270,12 @@ def ask(request: AskRequest) -> dict[str, Any]:
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+    answer, llm_used, model = generate_llm_answer(request.question, retrieved_papers)
+
     return {
         "question": request.question,
-        "answer": build_answer(request.question, retrieved_papers),
+        "llm_used": llm_used,
+        "model": model,
+        "answer": answer,
         "retrieved_papers": retrieved_papers,
     }
