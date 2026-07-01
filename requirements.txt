@@ -1,3 +1,8 @@
 # The collector intentionally uses only the Python standard library.
 # Keep this file so GitHub Actions and local setup have a stable place for
 # future optional dependencies.
+
+# Optional local RAG demo dependencies for rag_api.py.
+fastapi
+uvicorn
+scikit-learn
